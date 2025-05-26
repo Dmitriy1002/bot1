@@ -1,86 +1,74 @@
-use std::str::FromStr;
-use async_trait::async_trait;
-use solana_sdk::{native_token::LAMPORTS_PER_SOL, pubkey, pubkey::Pubkey, system_instruction};
-use std::{
-    collections::{HashMap, HashSet},
-    env,
-    sync::Arc,
-};
-use std::thread::sleep;
-use std::time::{Duration, SystemTime};
-use solana_sdk::hash::Hash;
-use solana_sdk::instruction::{AccountMeta, CompiledInstruction, Instruction};
-use solana_sdk::message::{Message, VersionedMessage};
-use solana_sdk::signature::Signer;
-use solana_sdk::signature::Keypair;
-use solana_sdk::system_instruction::SystemInstruction;
-use solana_sdk::sysvar::recent_blockhashes::RecentBlockhashes;
-use spl_associated_token_account::get_associated_token_address;
-use spl_associated_token_account::instruction::create_associated_token_account;
-use tokio::signal;
-use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
-use yellowstone_grpc_proto::geyser::{
-    CommitmentLevel, SubscribeRequestFilterAccounts, SubscribeRequestFilterTransactions,
-};
-use tracing::info;
-use crate::bench::Bench;
-use crate::geyser::{GeyserResult, YellowstoneGrpcGeyser, YellowstoneGrpcGeyserClient};
-use crate::config::PingThingsArgs;
-use crate::pumpfun::PumpFunController;
-
-pub const PUMPFUN_PROGRAM_ID: Pubkey = pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
-mod bench;
 mod config;
-mod tx_senders;
 mod geyser;
-mod pumpfun;
 mod core;
+mod tx_senders;
+mod meteora;
+mod metrics;
+mod metrics_server;
+
+use crate::config::PingThingsArgs;
+use crate::geyser::{YellowstoneGrpcGeyser, YellowstoneGrpcGeyserClient};
+use crate::meteora::controller::MeteoraController;
+use crate::metrics_server::start_metrics_server;
+use crate::tx_senders::constants::METEORA_PROGRAM_ID;
+
+use solana_sdk::signature::Keypair;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc};
+use tracing::{info, warn};
+use tokio::sync::RwLock;
+use tracing_subscriber::FmtSubscriber;
+use yellowstone_grpc_proto::geyser::{CommitmentLevel, SubscribeRequestFilterTransactions};
 
 #[tokio::main]
-pub async fn main() -> GeyserResult<()> {
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .finish(),
-    )
-        .unwrap();
+async fn main() -> anyhow::Result<()> {
+    // Инициализация логгера
+    FmtSubscriber::builder()
+        .with_max_level(tracing::Level::INFO)
+        .init();
 
-    let config_controller: PingThingsArgs = PingThingsArgs::new();
-    let bench_controller: Bench = Bench::new(config_controller.clone());
+    // Загрузка конфигурации
+    let args = PingThingsArgs::new();
+    let user = Arc::new(Keypair::from_base58_string(&args.private_key));
+    let meteora_controller = MeteoraController::new(args.clone(), user.clone());
 
-    let pumpfun_controller: PumpFunController = PumpFunController::new(config_controller.clone(), bench_controller.clone());
+    // Запуск HTTP-сервера для метрик Prometheus
+    tokio::spawn(async {
+        start_metrics_server().await;
+    });
 
-    info!("starting with config {:?}", config_controller);
-
-    env_logger::init();
-    dotenv::dotenv().ok();
-
-    let account_filters: HashMap<String, SubscribeRequestFilterAccounts> = HashMap::new();
-
-    let transaction_filter = SubscribeRequestFilterTransactions {
+    // Настройка фильтра транзакций для Meteora
+    let mut transaction_filters = HashMap::new();
+    let meteora_filter = SubscribeRequestFilterTransactions {
         vote: Some(false),
         failed: Some(false),
-        account_include: vec![PUMPFUN_PROGRAM_ID.to_string().clone()],
+        account_include: vec![METEORA_PROGRAM_ID.to_string()],
         account_exclude: vec![],
         account_required: vec![],
         signature: None,
     };
+    transaction_filters.insert("meteora_transaction_filter".to_string(), meteora_filter);
 
-    let mut transaction_filters: HashMap<String, SubscribeRequestFilterTransactions> =
-        HashMap::new();
-
-    transaction_filters.insert("pumpfun_transaction_filter".to_string(), transaction_filter);
-
-    let yellowstone_grpc = YellowstoneGrpcGeyserClient::new(
-        config_controller.geyser_url,
-        Some(config_controller.geyser_x_token),
+    let geyser = YellowstoneGrpcGeyserClient::new(
+        args.geyser_url.clone(),
+        Some(args.geyser_x_token.clone()),
         Some(CommitmentLevel::Processed),
-        account_filters,
+        HashMap::new(),
         transaction_filters,
         Arc::new(RwLock::new(HashSet::new())),
     );
 
-    let _ = yellowstone_grpc.consume(pumpfun_controller).await;
+    info!("Подключение к Geyser установлено");
+
+    // Подписка на поток транзакций через Geyser
+    geyser
+        .consume(move |tx, meta| {
+            let meteora_controller = meteora_controller.clone();
+            Box::pin(async move {
+                let _ = meteora_controller.transaction_handler(tx, meta).await;
+            })
+        })
+        .await?;
+
     Ok(())
 }

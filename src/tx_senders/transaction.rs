@@ -1,28 +1,28 @@
-use crate::config::{PingThingsArgs, RpcType};
-use crate::tx_senders::constants::{
-    JITO_TIP_ADDR,
-    PUMP_FUN_ACCOUNT_ADDR,
-    PUMP_FUN_PROGRAM_ADDR,
-    PUMP_FUN_TX_ADDR,
-    RENT_ADDR,
-    SYSTEM_PROGRAM_ADDR,
-    TOKEN_PROGRAM_ADDR,
+use crate::config::PingThingsArgs;
+use crate::config::RpcType;
+use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::{
+    compute_budget::ComputeBudgetInstruction,
+    hash::Hash,
+    instruction::{AccountMeta, Instruction},
+    message::{v0::Message, VersionedMessage},
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+    system_instruction,
+    transaction::VersionedTransaction,
 };
-use solana_sdk::compute_budget::ComputeBudgetInstruction;
-use solana_sdk::hash::Hash;
-use solana_sdk::instruction::{AccountMeta, Instruction};
-use solana_sdk::message::v0::Message;
-use solana_sdk::message::VersionedMessage;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{EncodableKey, Keypair, Signer};
-use solana_sdk::system_instruction;
-use solana_sdk::transaction::{Transaction, VersionedTransaction};
+use spl_associated_token_account::{get_associated_token_address, instruction::create_associated_token_account};
+use solana_sdk::system_program;
+use solana_sdk::native_token::LAMPORTS_PER_SOL;
+use anyhow::Result;
 use std::str::FromStr;
 use std::sync::Arc;
-use solana_sdk::native_token::LAMPORTS_PER_SOL;
-use spl_associated_token_account::get_associated_token_address;
-use spl_associated_token_account::instruction::create_associated_token_account;
-use tracing::{error, info, warn};
+use tracing::{info, debug, warn};
+
+use crate::tx_senders::constants::{
+    JITO_TIP_ADDR, PUMP_FUN_ACCOUNT_ADDR, PUMP_FUN_PROGRAM_ADDR, PUMP_FUN_TX_ADDR,
+    RENT_ADDR, SYSTEM_PROGRAM_ADDR, TOKEN_PROGRAM_ADDR,
+};
 
 #[derive(Clone)]
 pub struct TransactionConfig {
@@ -36,23 +36,20 @@ pub struct TransactionConfig {
 
 impl From<PingThingsArgs> for TransactionConfig {
     fn from(args: PingThingsArgs) -> Self {
-        let keypair =
-            Keypair::from_base58_string(args.private_key.as_str());
-
-        let tip: u64 = (args.tip * LAMPORTS_PER_SOL as f64) as u64;
-        let buy_amount: u64 = (args.buy_amount * LAMPORTS_PER_SOL as f64) as u64;
-        let min_amount_out: u64 = (args.min_amount_out * 1_000_000 as f64) as u64;
+        let keypair = Keypair::from_base58_string(args.private_key.as_str());
 
         TransactionConfig {
             keypair: Arc::new(keypair),
             compute_unit_limit: args.compute_unit_limit,
             compute_unit_price: args.compute_unit_price,
-            tip: tip,
-            buy_amount: buy_amount,
-            min_amount_out: min_amount_out
+            tip: (args.tip * LAMPORTS_PER_SOL as f64) as u64,
+            buy_amount: (args.buy_amount * LAMPORTS_PER_SOL as f64) as u64,
+            min_amount_out: (args.min_amount_out * 1_000_000.0) as u64,
         }
     }
 }
+
+// Pump.fun
 pub fn build_transaction_with_config(
     tx_config: &TransactionConfig,
     rpc_type: &RpcType,
@@ -61,72 +58,57 @@ pub fn build_transaction_with_config(
     bonding_curve: Pubkey,
     associated_bonding_curve: Pubkey,
 ) -> VersionedTransaction {
-
+    info!("Сборка транзакции Pump.fun");
     let mut instructions = Vec::new();
 
     if tx_config.compute_unit_limit > 0 {
-        let compute_unit_limit =
-            ComputeBudgetInstruction::set_compute_unit_limit(tx_config.compute_unit_limit);
-        instructions.push(compute_unit_limit);
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(tx_config.compute_unit_limit));
+        debug!("compute_unit_limit: {}", tx_config.compute_unit_limit);
     }
 
     if tx_config.compute_unit_price > 0 {
-        let compute_unit_price =
-            ComputeBudgetInstruction::set_compute_unit_price(tx_config.compute_unit_price);
-        instructions.push(compute_unit_price);
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_price(tx_config.compute_unit_price));
+        debug!("compute_unit_price: {}", tx_config.compute_unit_price);
     }
 
     if tx_config.tip > 0 {
-        let tip_instruction: Option<Instruction> = match rpc_type {
-            RpcType::Jito => Some(system_instruction::transfer(
+        if let RpcType::Jito = rpc_type {
+            debug!("🎁 Добавление чаевых Jito: {} лампортов", tx_config.tip);
+            instructions.push(system_instruction::transfer(
                 &tx_config.keypair.pubkey(),
                 &Pubkey::from_str(JITO_TIP_ADDR).unwrap(),
                 tx_config.tip,
-            )),
-            _ => None
-        };
-
-        if tip_instruction.is_some() {
-            instructions.push(tip_instruction.unwrap());
+            ));
         }
     }
 
-    let pump_fun_account_pubkey: Pubkey = Pubkey::from_str(PUMP_FUN_ACCOUNT_ADDR).unwrap();
-    let pump_fun_tx_pubkey: Pubkey = Pubkey::from_str(PUMP_FUN_TX_ADDR).unwrap();
-    let pump_fun_program_pubkey: Pubkey = Pubkey::from_str(PUMP_FUN_PROGRAM_ADDR).unwrap();
-
-    let rent_pubkey: Pubkey = Pubkey::from_str(RENT_ADDR).unwrap();
-    let system_program_pubkey: Pubkey = Pubkey::from_str(SYSTEM_PROGRAM_ADDR).unwrap();
-    let token_program_pubkey: Pubkey = Pubkey::from_str(TOKEN_PROGRAM_ADDR).unwrap();
-
     let owner = tx_config.keypair.pubkey();
-    let spl_token_address = get_associated_token_address(&owner, &token_address);
+    let token_program_pubkey = Pubkey::from_str(TOKEN_PROGRAM_ADDR).unwrap();
+    let user_token_account = get_associated_token_address(&owner, &token_address);
+    let ata_ix = create_associated_token_account(&owner, &owner, &token_address, &token_program_pubkey);
+    instructions.push(ata_ix);
 
-    let token_account_instruction =
-        create_associated_token_account(&owner, &owner, &token_address, &token_program_pubkey);
-
-    instructions.push(token_account_instruction);
-
-    // Swap instruction data
-    let buy: u64 = 16927863322537952870;
     let mut data = vec![];
+    let buy: u64 = 16927863322537952870;
     data.extend_from_slice(&buy.to_le_bytes());
     data.extend_from_slice(&tx_config.min_amount_out.to_le_bytes());
     data.extend_from_slice(&tx_config.buy_amount.to_le_bytes());
 
+    debug!("Подготовка инструкции swap");
+
     let accounts = vec![
-        AccountMeta::new_readonly(pump_fun_account_pubkey, false),
+        AccountMeta::new_readonly(Pubkey::from_str(PUMP_FUN_ACCOUNT_ADDR).unwrap(), false),
         AccountMeta::new(Pubkey::from_str("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM").unwrap(), false),
         AccountMeta::new_readonly(token_address, false),
         AccountMeta::new(bonding_curve, false),
         AccountMeta::new(associated_bonding_curve, false),
-        AccountMeta::new(spl_token_address, false),
+        AccountMeta::new(user_token_account, false),
         AccountMeta::new(owner, true),
-        AccountMeta::new_readonly(system_program_pubkey, false),
+        AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ADDR).unwrap(), false),
         AccountMeta::new_readonly(token_program_pubkey, false),
-        AccountMeta::new_readonly(rent_pubkey, false),
-        AccountMeta::new_readonly(pump_fun_tx_pubkey, false),
-        AccountMeta::new_readonly(pump_fun_program_pubkey, false),
+        AccountMeta::new_readonly(Pubkey::from_str(RENT_ADDR).unwrap(), false),
+        AccountMeta::new_readonly(Pubkey::from_str(PUMP_FUN_TX_ADDR).unwrap(), false),
+        AccountMeta::new_readonly(Pubkey::from_str(PUMP_FUN_PROGRAM_ADDR).unwrap(), false),
     ];
 
     let swap_instruction = Instruction {
@@ -137,15 +119,92 @@ pub fn build_transaction_with_config(
 
     instructions.push(swap_instruction);
 
-    let message_v0 = Message::try_compile(
-            &owner,
-            instructions.as_slice(),
-            &[],
-            recent_blockhash,
-        )
-            .unwrap();
-
+    let message_v0 = Message::try_compile(&owner, &instructions, &[], recent_blockhash).unwrap();
     let versioned_message = VersionedMessage::V0(message_v0);
-    
-    VersionedTransaction::try_new(versioned_message, &[&tx_config.keypair]).unwrap()
+    let tx = VersionedTransaction::try_new(versioned_message, &[&tx_config.keypair]).unwrap();
+
+    info!("Транзакция Pump.fun успешно собрана");
+
+    tx
+}
+
+// Meteora
+pub async fn build_swap_transaction(
+    args: &PingThingsArgs,
+    user: &Keypair,
+    pool: &Pubkey,
+    token_a: &Pubkey,
+    token_b: &Pubkey,
+    a_vault: &Pubkey,
+    b_vault: &Pubkey,
+    vault_token_a: &Pubkey,
+    vault_token_b: &Pubkey,
+    lp_mint_a: &Pubkey,
+    lp_mint_b: &Pubkey,
+    a_lp: &Pubkey,
+    b_lp: &Pubkey,
+    protocol_fee: &Pubkey,
+    vault_program: &Pubkey,
+    amount_in: u64,
+    min_out: u64,
+) -> Result<VersionedTransaction> {
+    info!("Сборка транзакции Meteora");
+    let mut instructions: Vec<Instruction> = Vec::new();
+    let owner = user.pubkey();
+
+    if args.compute_unit_limit > 0 {
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(args.compute_unit_limit));
+        debug!("compute_unit_limit: {}", args.compute_unit_limit);
+    }
+
+    if args.compute_unit_price > 0 {
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_price(args.compute_unit_price));
+        debug!("compute_unit_price: {}", args.compute_unit_price);
+    }
+
+    let user_token_account = get_associated_token_address(&owner, token_a);
+    let token_program_id = Pubkey::from_str(TOKEN_PROGRAM_ADDR).unwrap();
+    let ata_ix = create_associated_token_account(&owner, &owner, token_a, &token_program_id);
+    instructions.push(ata_ix);
+
+    let mut data = vec![1]; // swap discriminator
+    data.extend_from_slice(&amount_in.to_le_bytes());
+    data.extend_from_slice(&min_out.to_le_bytes());
+
+    debug!("Подготовка инструкции swap Meteora");
+
+    let accounts = vec![
+        AccountMeta::new_readonly(*pool, false),
+        AccountMeta::new(*a_vault, false),
+        AccountMeta::new(*b_vault, false),
+        AccountMeta::new(*vault_token_a, false),
+        AccountMeta::new(*vault_token_b, false),
+        AccountMeta::new(*a_lp, false),
+        AccountMeta::new(*b_lp, false),
+        AccountMeta::new_readonly(*protocol_fee, false),
+        AccountMeta::new(user_token_account, false),
+        AccountMeta::new(owner, true),
+        AccountMeta::new_readonly(system_program::id(), false),
+    ];
+
+    let swap_instruction = Instruction {
+        program_id: *vault_program,
+        accounts,
+        data,
+    };
+
+    instructions.push(swap_instruction);
+
+    let rpc = RpcClient::new(args.http_rpc.clone());
+    info!("Получение blockhash...");
+    let blockhash = rpc.get_latest_blockhash().await?;
+    debug!("Blockhash: {:?}", blockhash);
+
+    let message = Message::try_compile(&owner, &instructions, &[], blockhash)?;
+    let versioned_message = VersionedMessage::V0(message);
+
+    let transaction = VersionedTransaction::try_new(versioned_message, &[user])?;
+    info!("Транзакция Meteora успешно собрана");
+
+    Ok(transaction)
 }

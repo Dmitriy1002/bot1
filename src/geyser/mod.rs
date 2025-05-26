@@ -1,22 +1,20 @@
 use async_trait::async_trait;
-use futures::{sink::SinkExt, StreamExt};
-use solana_sdk::{account::Account, pubkey::Pubkey, signature::Signature};
-use std::collections::HashSet;
-use std::convert::TryFrom;
+use futures::StreamExt;
+use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
+use yellowstone_grpc_proto::prelude::*;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
-use std::{collections::HashMap, sync::Arc};
-use tracing::{error, info, warn};
-use tokio::sync::{mpsc::UnboundedSender, RwLock};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::RwLock;
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::tonic::transport::ClientTlsConfig;
-use yellowstone_grpc_proto::{
-    convert_from::{create_tx_meta, create_tx_versioned},
-    geyser::{
-        subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
-        SubscribeRequestFilterAccounts, SubscribeRequestFilterTransactions, SubscribeRequestPing,
-    },
+use yellowstone_grpc_proto::geyser::{
+    subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
+    SubscribeRequestFilterAccounts, SubscribeRequestFilterTransactions,
 };
+use thiserror::Error;
+use futures::future::BoxFuture;
+use yellowstone_grpc_proto::convert_from::create_tx_versioned;
 
 #[derive(Debug)]
 pub struct YellowstoneGrpcGeyserClient {
@@ -37,7 +35,7 @@ impl YellowstoneGrpcGeyserClient {
         transaction_filters: HashMap<String, SubscribeRequestFilterTransactions>,
         account_deletions_tracked: Arc<RwLock<HashSet<Pubkey>>>,
     ) -> Self {
-        YellowstoneGrpcGeyserClient {
+        Self {
             endpoint,
             x_token,
             commitment,
@@ -48,42 +46,36 @@ impl YellowstoneGrpcGeyserClient {
     }
 }
 
-pub type GeyserResult<T> = Result<T, Error>;
-
-#[async_trait]
-pub trait YellowstoneGrpcGeyser: Send + Sync {
-    async fn consume(
-        &self,
-        pump_fun_controller: PumpFunController
-    ) -> GeyserResult<()>;
-}
-
-use thiserror::Error;
-use crate::config::PingThingsArgs;
-use crate::pumpfun::PumpFunController;
-
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Custom error: {0}")]
     Custom(String),
 }
 
+pub type GeyserResult<T> = Result<T, Error>;
+
+#[async_trait]
+pub trait YellowstoneGrpcGeyser: Send + Sync {
+    async fn consume<F>(&self, handler: F) -> GeyserResult<()>
+    where
+        F: Fn(VersionedTransaction, TransactionStatusMeta) -> BoxFuture<'static, ()>
+            + Send
+            + Sync
+            + 'static;
+}
+
 #[async_trait]
 impl YellowstoneGrpcGeyser for YellowstoneGrpcGeyserClient {
-    async fn consume(
-        &self,
-        mut pump_fun_controller: PumpFunController
-    ) -> GeyserResult<()> {
-        let endpoint = self.endpoint.clone();
-        let x_token = self.x_token.clone();
-        let commitment = self.commitment;
-        let account_filters = self.account_filters.clone();
-        let transaction_filters = self.transaction_filters.clone();
-        let account_deletions_tracked = self.account_deletions_tracked.clone();
-
-        let mut geyser_client = GeyserGrpcClient::build_from_shared(endpoint)
+    async fn consume<F>(&self, handler: F) -> GeyserResult<()>
+    where
+        F: Fn(VersionedTransaction, TransactionStatusMeta) -> BoxFuture<'static, ()>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut geyser_client = GeyserGrpcClient::build_from_shared(self.endpoint.clone())
             .map_err(|err| Error::Custom(err.to_string()))?
-            .x_token(x_token)
+            .x_token(self.x_token.clone())
             .map_err(|err| Error::Custom(err.to_string()))?
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(15))
@@ -93,95 +85,52 @@ impl YellowstoneGrpcGeyser for YellowstoneGrpcGeyserClient {
             .await
             .map_err(|err| Error::Custom(err.to_string()))?;
 
-        let _ = tokio::spawn(async move {
-            let subscribe_request = SubscribeRequest {
-                slots: HashMap::new(),
-                accounts: account_filters,
-                transactions: transaction_filters,
-                transactions_status: HashMap::new(),
-                entry: HashMap::new(),
-                blocks: HashMap::new(),
-                blocks_meta: HashMap::new(),
-                commitment: commitment.map(|x| x as i32),
-                accounts_data_slice: vec![],
-                ping: None,
-            };
+        let subscribe_request = SubscribeRequest {
+            slots: HashMap::new(),
+            accounts: self.account_filters.clone(),
+            transactions: self.transaction_filters.clone(),
+            transactions_status: HashMap::new(),
+            entry: HashMap::new(),
+            blocks: HashMap::new(),
+            blocks_meta: HashMap::new(),
+            commitment: self.commitment.map(|x| x as i32),
+            accounts_data_slice: vec![],
+            ping: None,
+        };
 
-            loop {
-                tokio::select! {
-                    result = geyser_client.subscribe_with_request(Some(subscribe_request.clone())) => {
-                        match result {
-                            Ok((mut subscribe_tx, mut stream)) => {
-                                while let Some(message) = stream.next().await {
-                                    match message {
-                                        Ok(msg) => match msg.update_oneof {
-                                            Some(UpdateOneof::Transaction(transaction_update)) => {
-                                                let start_time = std::time::Instant::now();
+        let (mut _subscribe_tx, mut stream) =
+            geyser_client.subscribe_with_request(Some(subscribe_request)).await
+                .map_err(|err| Error::Custom(err.to_string()))?;
 
-                                                if let Some(transaction_info) =
-                                                    transaction_update.transaction
-                                                {
-                                                    let Ok(signature) =
-                                                        Signature::try_from(transaction_info.signature)
-                                                    else {
-                                                        continue;
-                                                    };
-                                                    let Some(yellowstone_transaction) =
-                                                        transaction_info.transaction
-                                                    else {
-                                                        continue;
-                                                    };
-                                                    let Some(yellowstone_tx_meta) = transaction_info.meta
-                                                    else {
-                                                        continue;
-                                                    };
-                                                    let Ok(versioned_transaction) =
-                                                        create_tx_versioned(yellowstone_transaction)
-                                                    else {
-                                                        continue;
-                                                    };
-                                                    let meta_original = match create_tx_meta(
-                                                        yellowstone_tx_meta,
-                                                    ) {
-                                                        Ok(meta) => meta,
-                                                        Err(err) => {
-                                                            log::error!(
-                                                                "Failed to create transaction meta: {:?}",
-                                                                err
-                                                            );
-                                                            continue;
-                                                        }
-                                                    };
-                                                    // info!("signature {:?}", signature);
-                                                     let  _ = pump_fun_controller.transaction_handler(
-                                                        signature,
-                                                        versioned_transaction,
-                                                        meta_original,
-                                                        transaction_info.is_vote,
-                                                        transaction_update.slot
-                                                     ).await;
-                                                } else {
-                                                    log::error!("No transaction info in `UpdateOneof::Transaction` at slot {}", transaction_update.slot);
-                                                }
-                                            }
+        while let Some(message) = stream.next().await {
+            match message {
+                Ok(msg) => {
+                    if let Some(UpdateOneof::Transaction(tx_update)) = msg.update_oneof {
+                        if let Some(tx_info) = tx_update.transaction {
+                            let Some(raw_tx) = tx_info.transaction else {
+                                log::warn!("Нет поля transaction");
+                                continue;
+                            };
+                            let Some(meta) = tx_info.meta else {
+                                log::warn!("Нет поля meta");
+                                continue;
+                            };
 
-                                            _ => {}
-                                        },
-                                        Err(error) => {
-                                            log::error!("Geyser stream error: {error:?}");
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                log::error!("Failed to subscribe: {:?}", e);
-                            }
+                            let Ok(versioned_tx) = create_tx_versioned(raw_tx) else {
+                                log::warn!("Не удалось сконвертировать transaction");
+                                continue;
+                            };
+
+                            handler(versioned_tx, meta).await;
                         }
                     }
                 }
+                Err(error) => {
+                    log::error!("Geyser stream error: {:?}", error);
+                    break;
+                }
             }
-        }).await;
+        }
 
         Ok(())
     }
