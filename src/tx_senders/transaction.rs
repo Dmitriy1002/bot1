@@ -73,7 +73,7 @@ pub fn build_transaction_with_config(
 
     if tx_config.tip > 0 {
         if let RpcType::Jito = rpc_type {
-            debug!("🎁 Добавление чаевых Jito: {} лампортов", tx_config.tip);
+            debug!("Добавление чаевых Jito: {} лампортов", tx_config.tip);
             instructions.push(system_instruction::transfer(
                 &tx_config.keypair.pubkey(),
                 &Pubkey::from_str(JITO_TIP_ADDR).unwrap(),
